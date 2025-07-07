@@ -2,6 +2,8 @@
 #include <ESP32Time.h>
 #include <time.h>
 #include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 // ---------- BEGIN DEBUG ---------- //
 #define SERIAL_DEBUG_ENABLED 1
@@ -86,14 +88,14 @@ eventType event_type[MAX_TYPE_EVENTS] = {wifi_sensor, input_listener, scheduled,
 #define BUZZER_OUT_MIN        100
 #define BUZZER_OUT_MAX        2000
 
-#define SPEED_MOTOR           70
-//#define PWM_FREQUENCY         5000
-//#define PWM_RESOLUTION        8          
+#define SPEED_MOTOR           80
+//#define PWM_FREQUENCY       5000
+//#define PWM_RESOLUTION      8          
 
 #define UMBRAL_DIFF_NEW_EVENT 200
 #define UMBRAL_DIFF_TIMES     5
 #define UMBRAL_COUNTDOWN      10
-#define UMBRAL_DIFF_VOL       15
+#define UMBRAL_DIFF_VOL       50
 
 #define TS_CHANGE_STATE       200
 #define TS_COUNTDOWN          1000
@@ -103,6 +105,13 @@ eventType event_type[MAX_TYPE_EVENTS] = {wifi_sensor, input_listener, scheduled,
 
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
+
+const char* mqtt_server = "industrial.api.ubidots.com";
+const int mqtt_port = 1883;
+const char* mqtt_user = "BBUS-LoruLGYMGNGH4qFXgB0qkgn8FYsfx2";
+const char* mqtt_passwd = "";
+const char* topic_fecha = "/v1.6/devices/esp32/fecha";
+const char* topic_volume = "/v1.6/devices/esp32/volume";
 
 const long gmtOffset_sec = GM_OFFSET_ARG;
 const int daylightOffset_sec = DAY_LIGHT_OFFSET;
@@ -125,6 +134,11 @@ struct tm user_time;
 time_t user_timestamp;
 ESP32Time rtc;
 
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+bool mqtt_input_ready = false;
+
 QueueHandle_t queue_motor;
 
 long ts_wifi                  = 0;
@@ -137,8 +151,10 @@ long ts_pot                   = -1;
 // ---------- END VARIABLES ---------- //
 
 // ---------- BEGIN FUNCTIONS ---------- //
-bool is_valid_date(String input);
+bool is_valid_timestamp();
+void reconnectMQTT();
 void toggle_motor(void *param);
+void callback(char* topic, byte* payload, unsigned int length);
 void motor_on();
 void motor_off();
 void buzzer_on();
@@ -146,7 +162,8 @@ void buzzer_off();
 // ---------- END FUNCTIONS ---------- //
 
 // ---------- BEGIN ACTIONS ---------- //
-void init_(){
+void init_()
+{
   ts_wifi = -1;
   ts_input = 0;
   ts_pot = 0;
@@ -231,6 +248,10 @@ void error()
 
 void volumen()
 {
+  reconnectMQTT();
+  String volume = String(pot_value_new);
+  client.publish(topic_volume, volume.c_str());
+
   pot_value = pot_value_new;
 
   DebugPrint(pot_value);
@@ -275,8 +296,9 @@ void do_init()
     NULL
   );
 
-  //ledcAttach(PIN_LED_SPEED, PWM_FREQUENCY, PWM_RESOLUTION);
-  //ledcWrite(PIN_LED_SPEED, SPEED_MOTOR);
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+
   analogWrite(PIN_LED_SPEED, SPEED_MOTOR);
 
   pot_value = analogRead(PIN_POT);
@@ -314,9 +336,6 @@ bool wifi_sensor(unsigned long ct)
           rtc.setTime(mktime(&time_system));
           DebugPrint("Horario del sistema configurado.");
 
-          WiFi.disconnect(true);
-          WiFi.mode(WIFI_OFF);
-
           new_event = EV_CFG;
           return true;
         } 
@@ -337,20 +356,20 @@ bool input_listener(unsigned long ct)
     {
       ts_input = ct;
 
-      if (Serial.available() > 0)
+      reconnectMQTT();
+
+      client.loop();
+
+      if(mqtt_input_ready)
       {
-        String input_user = Serial.readStringUntil('\n');
-
-        if(is_valid_date(input_user))
+        if(is_valid_timestamp())
         {
-            DebugPrint("Fecha y hora almacenadas correctamente.");
-            user_timestamp = mktime(&user_time);
+          DebugPrint("Fecha y hora almacenadas correctamente.");
+          mqtt_input_ready = false;
 
-            new_event = EV_IN;
-            return true;
-        } 
-        
-        DebugPrint("Fecha inválida");
+          new_event = EV_IN;
+          return true;
+        }
       }
     }
   }
@@ -479,32 +498,37 @@ bool pot_sensor(unsigned long ct)
 // ---------- END EVENTS ---------- //
 
 // ---------- BEGIN FUNCTIONS ---------- //
-bool is_valid_date(String input) 
+bool is_valid_timestamp()
 {
-  input.trim();
+  time_t now = rtc.getEpoch();
 
-  memset(&user_time, 0, sizeof(user_time));
-  int user_year, user_month, user_day, user_hour, user_min, user_sec;
-
-  if (sscanf(input.c_str(), "%d-%d-%d %d:%d:%d", 
-             &user_year, &user_month, &user_day, &user_hour, &user_min, &user_sec) == 6) 
-  {
-    user_time.tm_year = user_year - OFFSET_YEAR;
-    user_time.tm_mon  = user_month - OFFSET_MONTH;
-    user_time.tm_mday = user_day;
-    user_time.tm_hour = user_hour;
-    user_time.tm_min  = user_min;
-    user_time.tm_sec  = user_sec;
-    user_time.tm_isdst = CONFIG_TIME;
-
-    return true;
-  } 
-  
-  DebugPrint("Formato inválido. Usa YYYY-MM-DD HH:MM:SS");
-  return false;
+  return (user_timestamp > now);
 }
 
-void toggle_motor(void *param) {
+void reconnectMQTT()
+{
+  if (!client.connected())
+  {
+    if (client.connect("ubidots", mqtt_user, mqtt_passwd)) 
+    {
+      if(client.subscribe(topic_fecha))
+      {
+        DebugPrint("Conectado al broker MQTT.");
+      }
+      else
+      {
+        DebugPrint("Error al suscribirse al topic.");
+      }
+    } 
+    else 
+    {
+      DebugPrint("Fallo la conexión al broker MQTT.");
+    }
+  }
+}
+
+void toggle_motor(void *param) 
+{
   int value_recv;
 
   while (true) 
@@ -515,6 +539,38 @@ void toggle_motor(void *param) {
     }
   }
 }
+
+void callback(char* topic, byte* payload, unsigned int length) 
+{
+  String message((char*)payload, length);
+
+  //DebugPrint(String(message));  
+  const size_t capacity = 1024;
+  StaticJsonDocument<capacity> doc;
+
+  DeserializationError error = deserializeJson(doc, message);
+  if (error) 
+  {
+    DebugPrint("Error al parsear JSON: ");
+    DebugPrint(error.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("value")) 
+  {
+    DebugPrint("No se encontró el campo 'value'.");
+    return;
+  }
+
+  const time_t timestamp_now = doc["value"];
+
+  if (user_timestamp != timestamp_now) 
+  {
+    user_timestamp = timestamp_now;
+    mqtt_input_ready = true;
+  }
+}
+
 
 void motor_on()
 {
